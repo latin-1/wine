@@ -760,8 +760,13 @@ static void register_avicap_devices(void)
         V_VT(&var) = VT_I4;
         V_I4(&var) = i;
         IPropertyBag_Write(prop_bag, L"VFWIndex", &var);
-
         VariantClear(&var);
+
+        V_VT(&var) = VT_BSTR;
+        V_BSTR(&var) = SysAllocString(name);
+        IPropertyBag_Write(prop_bag, L"DevicePath", &var);
+        VariantClear(&var);
+
         IPropertyBag_Release(prop_bag);
     }
 }
