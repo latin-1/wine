@@ -90,6 +90,7 @@ static BOOL video_init(void)
 struct caps
 {
     __u32 pixelformat;
+    __u32 depth;
     AM_MEDIA_TYPE media_type;
     VIDEOINFOHEADER video_info;
     VIDEO_STREAM_CONFIG_CAPS config;
@@ -101,7 +102,8 @@ struct video_capture_device
     struct caps *caps;
     LONG caps_count;
 
-    int image_size, image_pitch;
+    int bytes_per_pixel, out_bytes_per_pixel;
+    int image_size, out_image_size, image_pitch, out_image_pitch;
     BYTE *image_data;
 
     int fd, mmap;
@@ -167,12 +169,13 @@ static HRESULT CDECL v4l_device_check_format(struct video_capture_device *device
 static HRESULT set_caps(struct video_capture_device *device, const struct caps *caps)
 {
     struct v4l2_format format = {0};
-    LONG width, height, image_size;
+    LONG width, height, image_size, out_image_size;
     BYTE *image_data;
 
     width = caps->video_info.bmiHeader.biWidth;
     height = caps->video_info.bmiHeader.biHeight;
-    image_size = width * height * caps->video_info.bmiHeader.biBitCount / 8;
+    image_size = width * height * caps->depth / 8;
+    out_image_size = width * height * caps->video_info.bmiHeader.biBitCount / 8;
 
     if (!(image_data = malloc(image_size)))
     {
@@ -195,8 +198,12 @@ static HRESULT set_caps(struct video_capture_device *device, const struct caps *
     }
 
     device->current_caps = caps;
+    device->bytes_per_pixel = caps->depth / 8;
+    device->out_bytes_per_pixel = caps->video_info.bmiHeader.biBitCount / 8;
     device->image_size = image_size;
-    device->image_pitch = width * caps->video_info.bmiHeader.biBitCount / 8;
+    device->out_image_size = out_image_size;
+    device->image_pitch = width * caps->depth / 8;
+    device->out_image_pitch = width * caps->video_info.bmiHeader.biBitCount / 8;
     free(device->image_data);
     device->image_data = image_data;
     return S_OK;
@@ -318,22 +325,32 @@ static HRESULT CDECL v4l_device_set_prop(struct video_capture_device *device,
     return S_OK;
 }
 
-static void reverse_image(struct video_capture_device *device, LPBYTE output, const BYTE *input)
+static void transform_image(struct video_capture_device *device, LPBYTE output, const BYTE *input)
 {
-    int inoffset, outoffset, pitch;
+    int in_offset, out_offset;
+    int in_bytes_per_pixel = device->bytes_per_pixel;
+    int out_bytes_per_pixel = device->out_bytes_per_pixel;
+    int in_pitch = device->image_pitch;
+    int out_pitch = device->out_image_pitch;
 
     /* the whole image needs to be reversed,
        because the dibs are messed up in windows */
-    outoffset = device->image_size;
-    pitch = device->image_pitch;
-    inoffset = 0;
-    while (outoffset > 0)
+    in_offset = 0;
+    out_offset = device->out_image_size;
+    while (out_offset > 0)
     {
-        int x;
-        outoffset -= pitch;
-        for (x = 0; x < pitch; x++)
-            output[outoffset + x] = input[inoffset + x];
-        inoffset += pitch;
+        int in_x = 0;
+        int out_x = 0;
+        out_offset -= out_pitch;
+        while (out_x < out_pitch)
+        {
+            output[out_offset + out_x] = input[in_offset + in_x];
+            output[out_offset + out_x + 1] = input[in_offset + in_x + 1];
+            output[out_offset + out_x + 2] = input[in_offset + in_x + 2];
+            in_x += in_bytes_per_pixel;
+            out_x += out_bytes_per_pixel;
+        }
+        in_offset += in_pitch;
     }
 }
 
@@ -348,29 +365,29 @@ static BOOL CDECL v4l_device_read_frame(struct video_capture_device *device, BYT
         }
     }
 
-    reverse_image(device, data, device->image_data);
+    transform_image(device, data, device->image_data);
     return TRUE;
 }
 
 static void fill_caps(__u32 pixelformat, __u32 width, __u32 height,
-        __u32 max_fps, __u32 min_fps, struct caps *caps)
+        __u32 max_fps, __u32 min_fps, __u32 depth, __u32 out_depth, struct caps *caps)
 {
-    LONG depth = 24;
-
     memset(caps, 0, sizeof(*caps));
-    caps->video_info.dwBitRate = width * height * depth * max_fps;
+    caps->video_info.dwBitRate = width * height * out_depth * max_fps;
     caps->video_info.bmiHeader.biSize = sizeof(caps->video_info.bmiHeader);
     caps->video_info.bmiHeader.biWidth = width;
     caps->video_info.bmiHeader.biHeight = height;
     caps->video_info.bmiHeader.biPlanes = 1;
-    caps->video_info.bmiHeader.biBitCount = depth;
+    caps->video_info.bmiHeader.biBitCount = out_depth;
     caps->video_info.bmiHeader.biCompression = BI_RGB;
-    caps->video_info.bmiHeader.biSizeImage = width * height * depth / 8;
+    caps->video_info.bmiHeader.biSizeImage = width * height * out_depth / 8;
     caps->media_type.majortype = MEDIATYPE_Video;
     caps->media_type.subtype = MEDIASUBTYPE_RGB24;
+    if (out_depth == 32)
+        caps->media_type.subtype = MEDIASUBTYPE_RGB32;
     caps->media_type.bFixedSizeSamples = TRUE;
     caps->media_type.bTemporalCompression = FALSE;
-    caps->media_type.lSampleSize = width * height * depth / 8;
+    caps->media_type.lSampleSize = width * height * out_depth / 8;
     caps->media_type.formattype = FORMAT_VideoInfo;
     caps->media_type.pUnk = NULL;
     caps->media_type.cbFormat = sizeof(VIDEOINFOHEADER);
@@ -383,9 +400,10 @@ static void fill_caps(__u32 pixelformat, __u32 width, __u32 height,
     caps->config.MinOutputSize.cx = width;
     caps->config.MinOutputSize.cy = height;
     caps->config.guid = FORMAT_VideoInfo;
-    caps->config.MinBitsPerSecond = width * height * depth * min_fps;
-    caps->config.MaxBitsPerSecond = width * height * depth * max_fps;
+    caps->config.MinBitsPerSecond = width * height * out_depth * min_fps;
+    caps->config.MaxBitsPerSecond = width * height * out_depth * max_fps;
     caps->pixelformat = pixelformat;
+    caps->depth = depth;
 }
 
 static void CDECL v4l_device_get_caps(struct video_capture_device *device, LONG index,
@@ -520,8 +538,11 @@ struct video_capture_device * CDECL v4l_device_create(USHORT index)
         if (!new_caps)
             goto error;
         device->caps = new_caps;
+        // fill_caps(format.fmt.pix.pixelformat, frmsize.discrete.width, frmsize.discrete.height,
+        //         max_fps, min_fps, 24, 24, &device->caps[device->caps_count]);
+        // device->caps_count++;
         fill_caps(format.fmt.pix.pixelformat, frmsize.discrete.width, frmsize.discrete.height,
-                max_fps, min_fps, &device->caps[device->caps_count]);
+                max_fps, min_fps, 24, 32, &device->caps[device->caps_count]);
         device->caps_count++;
 
         frmsize.index++;
